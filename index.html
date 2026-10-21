@@ -61,7 +61,7 @@ footer{padding:0 18px 22px;color:#64748b;font-size:.78rem;max-width:980px;margin
     <input id="target" type="number" min="30" max="240" value="120" style="width:88px;padding:10px;border:1px solid #cbd5e1;border-radius:10px">
     <button id="setRef" class="secondary">Fijar referencia</button>
   </div>
-  <p class="status">Corrección importante: esta versión cuenta solo un tipo de punto de retorno de la muñeca por ciclo para evitar duplicar el tempo. Sigue siendo una estimación experimental: no reconoce automáticamente la anacrusa ni todos los patrones de dirección.</p>
+  <p class="status">El prototipo estima pulsos a partir de cambios periódicos en la trayectoria de la muñeca. Todavía no interpreta de forma fiable todos los patrones de dirección ni identifica automáticamente la anacrusa musical.</p>
   <div class="metrics" style="margin-top:12px">
     <div class="metric"><small>Tempo estimado</small><b id="bpmMetric">— BPM</b></div>
     <div class="metric"><small>Referencia activa</small><b id="refMetric">120 BPM</b></div>
@@ -186,24 +186,26 @@ function loop(){
  ctx.beginPath();ctx.moveTo(shoulder.x*overlay.width,shoulder.y*overlay.height);ctx.lineTo(x,y);ctx.strokeStyle="#f59e0b";ctx.lineWidth=Math.max(3,overlay.width*.004);ctx.stroke();
  if(lastWristY!==null){
   const dy=y-lastWristY;
-  // Image y grows downwards. Count only the bottom of the downstroke
-  // (moving down, then reversing upward), not both reversals of each cycle.
-  // Counting both top and bottom was causing a roughly doubled tempo.
+  // Count only the lower reversal (downstroke then upward movement), not both
+  // extremes. Counting both turns of a cycle can double the estimated tempo.
   if(Math.abs(dy)>overlay.height*.0015){
    const reversal = lastDY!==0 && Math.sign(dy)!==Math.sign(lastDY)
      && Math.abs(lastDY)>overlay.height*.0022;
-   const isDownstrokeBottom = reversal && lastDY>0 && dy<0;
-   if(isDownstrokeBottom){
+   const lowerReversal = reversal && lastDY>0 && dy<0;
+   if(lowerReversal){
     const t=now;
-    const interval=t-lastExtremumAt;
     if(lastExtremumAt===0){
-     lastExtremumAt=t; // first point sets timing origin only
-    } else if(interval>=250&&interval<=3000){
-     acceptCandidate(t,60000/interval);
-     lastExtremumAt=t;
-    } else if(interval>3000){
-     lastExtremumAt=t;
-     bpmHistory=[];pending=[];
+     lastExtremumAt=t; // first point is only a timing origin
+    } else {
+     const interval=t-lastExtremumAt;
+     if(interval>=250&&interval<=3000){
+      acceptCandidate(t,60000/interval);
+      lastExtremumAt=t;
+     } else if(interval>3000){
+      // Reacquire after a pause/missed cycle; do not report an absurd tempo.
+      lastExtremumAt=t;
+      bpmHistory=[];pending=[];
+     }
     }
    }
    lastDY=dy;
@@ -212,36 +214,44 @@ function loop(){
  lastWristY=y;
 }
 function acceptCandidate(t,instantBpm){
- // Reject isolated detections that are much too close or far apart.
- // The main half/double protection comes from measuring one matching extremum
- // per full movement cycle, rather than every direction reversal.
+ // Validate the elapsed time against the currently active beat period.
+ // This rejects accidental duplicate detections while allowing gradual changes.
  if(lastAcceptedAt){
   const dt=t-lastAcceptedAt, expected=60000/activeRef;
   if(dt<expected*.42 || dt>expected*2.2) return;
  }
- lastAcceptedAt=t;beatTimes.push(t);if(beatTimes.length>20)beatTimes.shift();
- bpmHistory.push(instantBpm);if(bpmHistory.length>12)bpmHistory.shift();
- const recent=bpmHistory.slice(-5).sort((a,b)=>a-b);
- const bpm=recent[Math.floor(recent.length/2)];
+ lastAcceptedAt=t;
+ beatTimes.push(t); if(beatTimes.length>20) beatTimes.shift();
+ bpmHistory.push(instantBpm); if(bpmHistory.length>7) bpmHistory.shift();
+ const sortedRecent=[...bpmHistory].sort((a,b)=>a-b);
+ const bpm=sortedRecent[Math.floor(sortedRecent.length/2)];
  $("bpmMetric").textContent=Math.round(bpm)+" BPM";
- chartPoints.push({t,bpm});if(chartPoints.length>120)chartPoints.shift();drawChart();
- const deviation=bpm-activeRef;
+ chartPoints.push({t,bpm}); if(chartPoints.length>120) chartPoints.shift(); drawChart();
+
+ // Determine colour relative to active reference, unless a new tempo was just confirmed.
  if(greenBeats>0){
-  setState("new");greenBeats--;if(greenBeats===0)setState("normal");
- }else if(Math.abs(deviation)<=3){setState("normal")}
- else if(deviation>3){setState("early")}
- else {setState("late")}
- // Candidate tempo window: nine consecutive estimates in a tight cluster, allowing small fluctuations.
- pending.push(bpm);if(pending.length>9)pending.shift();
- if(pending.length===9){
-  const sorted=[...pending].sort((a,b)=>a-b), med=sorted[4];
-  const spread=sorted[8]-sorted[0];
+  setState("new");
+  greenBeats--;
+  if(greenBeats===0) setState(Math.abs(bpm-activeRef)<=3?"normal":(bpm>activeRef?"early":"late"));
+ } else {
+  const deviation=bpm-activeRef;
+  if(Math.abs(deviation)<=3) setState("normal");
+  else if(deviation>3) setState("early");
+  else setState("late");
+ }
+
+ // New-tempo candidate: nine consecutive estimates may fluctuate slightly.
+ // Use median and median absolute deviation so one noisy beat doesn't block confirmation.
+ pending.push(bpm); if(pending.length>9) pending.shift();
+ if(pending.length===9 && greenBeats===0){
+  const vals=[...pending].sort((a,b)=>a-b), med=vals[4];
+  const deviations=pending.map(v=>Math.abs(v-med)).sort((a,b)=>a-b);
+  const mad=deviations[4];
   const change=Math.abs(med-activeRef);
-  const stable=spread<=5 && Math.abs(med-pending[0])<=4;
+  const stable=mad<=2.5 && vals[8]-vals[0]<=8;
   if(stable && change>3){
-   activeRef=med;pending=[];greenBeats=3;setState("new");
+   activeRef=med; pending=[]; greenBeats=3; setState("new");
    $("refMetric").textContent=Math.round(activeRef)+" BPM";
-   if(tempoScreen.classList.contains("active"))showTempo(med);
   }
  }
  if(tempoScreen.classList.contains("active")){
