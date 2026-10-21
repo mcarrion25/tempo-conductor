@@ -30,6 +30,11 @@ main{max-width:980px;margin:0 auto;padding:16px;display:grid;gap:16px}
 #tempoScreen[data-state="early"]{background:#2563eb;color:#fff}
 #tempoScreen[data-state="new"]{background:#16a34a;color:#fff}
 #tempoScreen[data-state="normal"]{background:#fff;color:#111}
+#miniCamera{position:absolute;right:12px;bottom:12px;width:min(26vw,220px);aspect-ratio:4/3;border:2px solid rgba(100,116,139,.65);border-radius:12px;overflow:hidden;background:#111;box-shadow:0 3px 14px #0002}
+#miniCamera video,#miniCamera canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+#miniCamera span{position:absolute;left:5px;top:5px;background:#0009;color:#fff;border-radius:5px;padding:3px 5px;font-size:11px}
+#resetHint{position:absolute;left:12px;bottom:14px;font-size:clamp(10px,1.5vw,14px);opacity:.65}
+@media(max-width:600px){#miniCamera{width:30vw;right:8px;bottom:8px}#resetHint{max-width:62%;left:8px;bottom:8px}}
 .metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 .metric{background:#f8fafc;border-radius:12px;padding:12px}.metric small{display:block;color:#64748b}.metric b{font-size:1.25rem}
 canvas#chart{width:100%;height:210px;display:block}
@@ -43,7 +48,7 @@ footer{padding:0 18px 22px;color:#64748b;font-size:.78rem;max-width:980px;margin
 <main>
 <section class="panel">
   <h2 style="margin:0 0 8px">1. Cámara y seguimiento</h2>
-  <p class="status">Coloca el móvil frente al estudiante, con el brazo que dirige visible. La detección corporal funciona en el dispositivo; el detector se descarga la primera vez.</p>
+  <p class="status">Coloca el móvil frente al estudiante, con ambos hombros y la muñeca que dirige visibles. Durante la pantalla completa aparece una vista pequeña de seguimiento para que puedas ver el punto naranja y el tempo a la vez.</p>
   <div id="cameraWrap"><video id="video" playsinline muted></video><canvas id="overlay"></canvas></div>
   <div class="controls" style="margin-top:12px">
     <button id="startBtn" disabled>Activar cámara</button>
@@ -90,6 +95,8 @@ footer{padding:0 18px 22px;color:#64748b;font-size:.78rem;max-width:980px;margin
   <button id="closeFullscreen">Cerrar ✕</button>
   <div id="tempoValue">120</div>
   <div id="tempoSub"></div>
+  <div id="miniCamera"><video id="miniVideo" playsinline muted></video><canvas id="miniOverlay"></canvas><span>Seguimiento</span></div>
+  <div id="resetHint">Manos arriba y quietas = reiniciar referencia</div>
 </div>
 
 <script type="module">
@@ -97,12 +104,14 @@ import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@m
 
 const $ = id => document.getElementById(id);
 const video = $("video"), overlay = $("overlay"), ctx = overlay.getContext("2d");
+const miniVideo = $("miniVideo"), miniOverlay = $("miniOverlay"), miniCtx = miniOverlay.getContext("2d");
 const tempoScreen = $("tempoScreen"), tempoValue = $("tempoValue"), tempoSub = $("tempoSub");
 let landmarker = null, stream = null, running = false, raf = 0;
-let lastVideoTime = -1, lastWristY = null, lastDY = 0, lastExtremumAt = 0;
+let lastVideoTime = -1, lastWristY = null, smoothY = null, lastDY = 0, lastExtremumAt = 0, lastExtremumY = null, extremeProminence = 0;
 let extrema = [], beatTimes = [], bpmHistory = [], chartPoints = [];
 let activeRef = 120, initialRef = 120, pending = [], greenBeats = 0, greenUntil = 0;
 let state = "normal", lastAcceptedAt = 0, lastPulseTime = 0;
+let raisedStillSince = 0, resetGestureLatched = false, calibrating = false, calibrationIntervals = [];
 const modelStatus = $("modelStatus"), statusEl = $("status");
 
 function setStatus(s){statusEl.textContent=s}
@@ -145,9 +154,9 @@ document.addEventListener("fullscreenchange",()=>{if(!document.fullscreenElement
 $("startBtn").addEventListener("click",async()=>{
  try{
   stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:1280},height:{ideal:720},frameRate:{ideal:60,max:60}},audio:false});
-  video.srcObject=stream; await video.play();
-  overlay.width=video.videoWidth;overlay.height=video.videoHeight;
-  running=true;lastVideoTime=-1;setStatus("Cámara activa. Mantén visible la muñeca y realiza un gesto de dirección regular.");
+  video.srcObject=stream; miniVideo.srcObject=stream; await video.play(); await miniVideo.play().catch(()=>{});
+  overlay.width=video.videoWidth;overlay.height=video.videoHeight; miniOverlay.width=video.videoWidth; miniOverlay.height=video.videoHeight;
+  running=true;lastVideoTime=-1;calibrating=true;calibrationIntervals=[];lastExtremumAt=0;lastExtremumY=null;lastWristY=null;smoothY=null;lastAcceptedAt=0;setStatus("Cámara activa. Dirige con pulsos regulares para calibrar el tempo inicial.");
   $("startBtn").disabled=true;$("stopBtn").disabled=false;$("fullBtn").disabled=false;
   loop();
  }catch(e){setStatus("No se pudo acceder a la cámara. Permite el acceso y usa HTTPS o localhost. "+e.message)}
@@ -155,18 +164,18 @@ $("startBtn").addEventListener("click",async()=>{
 $("stopBtn").addEventListener("click",stopCamera);
 function stopCamera(){
  running=false;cancelAnimationFrame(raf);
- if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;
+ if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;miniVideo.srcObject=null;
  $("startBtn").disabled=false;$("stopBtn").disabled=true;
  ctx.clearRect(0,0,overlay.width,overlay.height);setStatus("Cámara detenida.");
 }
 $("setRef").addEventListener("click",()=>{
  const v=Math.max(30,Math.min(240,Number($("target").value)||120));
- initialRef=activeRef=v;pending=[];beatTimes=[];bpmHistory=[];greenBeats=0;
+ initialRef=activeRef=v;pending=[];beatTimes=[];bpmHistory=[];greenBeats=0;calibrating=false;calibrationIntervals=[];lastAcceptedAt=0;lastExtremumAt=0;lastExtremumY=null;lastWristY=null;smoothY=null;
  $("refMetric").textContent=Math.round(activeRef)+" BPM";setState("normal");setStatus("Referencia inicial fijada en "+Math.round(v)+" BPM.");
 });
 $("resetBtn").addEventListener("click",()=>{
- pending=[];beatTimes=[];bpmHistory=[];chartPoints=[];activeRef=initialRef=Math.max(30,Math.min(240,Number($("target").value)||120));
- $("refMetric").textContent=Math.round(activeRef)+" BPM";$("bpmMetric").textContent="— BPM";setState("normal");drawChart();
+ pending=[];beatTimes=[];bpmHistory=[];chartPoints=[];calibrating=true;calibrationIntervals=[];lastAcceptedAt=0;lastExtremumAt=0;lastExtremumY=null;lastWristY=null;smoothY=null;activeRef=initialRef=Math.max(30,Math.min(240,Number($("target").value)||120));
+ $("refMetric").textContent="Esperando pulso";$("bpmMetric").textContent="Calibrando…";setState("normal");drawChart();setStatus("Sesión reiniciada. Dirige con pulsos regulares para establecer el tempo inicial.");
 });
 function loop(){
  if(!running)return;
@@ -178,34 +187,60 @@ function loop(){
  try{result=landmarker.detectForVideo(video,now)}catch(e){return}
  ctx.clearRect(0,0,overlay.width,overlay.height);
  const pose=result.landmarks?.[0];if(!pose)return;
- // Pose landmark indices: left wrist 15, right wrist 16, shoulders 11/12.
+ // Pose landmarks: wrists 15/16, shoulders 11/12.
+ const lw=pose[15], rw=pose[16], ls=pose[11], rs=pose[12];
  const side=$("hand").value, wrist=pose[side==="right"?16:15], shoulder=pose[side==="right"?12:11];
- if(!wrist||wrist.visibility<.35||!shoulder||shoulder.visibility<.25)return;
- const x=wrist.x*overlay.width,y=wrist.y*overlay.height;
- ctx.beginPath();ctx.arc(x,y,Math.max(9,overlay.width*.012),0,Math.PI*2);ctx.fillStyle="#f59e0b";ctx.fill();
- ctx.beginPath();ctx.moveTo(shoulder.x*overlay.width,shoulder.y*overlay.height);ctx.lineTo(x,y);ctx.strokeStyle="#f59e0b";ctx.lineWidth=Math.max(3,overlay.width*.004);ctx.stroke();
+ if(!wrist||wrist.visibility<.4||!shoulder||shoulder.visibility<.3)return;
+ // Gesture shortcut: both hands above shoulders and nearly still for 1.2 s resets calibration.
+ const handsVisible=lw&&rw&&ls&&rs&&lw.visibility>.45&&rw.visibility>.45&&ls.visibility>.35&&rs.visibility>.35;
+ const handsRaised=handsVisible && lw.y<ls.y-.04 && rw.y<rs.y-.04;
+ const bothStill=handsRaised && Math.abs((lw.y||0)-(window._prevLWY??lw.y))<.008
+                           && Math.abs((rw.y||0)-(window._prevRWY??rw.y))<.008;
+ window._prevLWY=lw?.y; window._prevRWY=rw?.y;
+ if(bothStill){
+  if(!raisedStillSince)raisedStillSince=now;
+  if(now-raisedStillSince>1200&&!resetGestureLatched){
+   resetGestureLatched=true;calibrating=true;calibrationIntervals=[];
+   lastWristY=null;smoothY=null;lastDY=0;lastExtremumAt=0;lastExtremumY=null;extremeProminence=0;
+   lastAcceptedAt=0;beatTimes=[];bpmHistory=[];pending=[];greenBeats=0;chartPoints=[];
+   $("bpmMetric").textContent="Calibrando…";$("refMetric").textContent="Esperando pulso";
+   setState("normal");drawChart();
+   setStatus("Referencia reiniciada por gesto de manos arriba. Baja las manos y dirige con pulsos regulares para calibrar el tempo inicial.");
+  }
+ } else {
+  raisedStillSince=0;
+  if(!handsRaised)resetGestureLatched=false;
+ }
+ const x=wrist.x*overlay.width, rawY=wrist.y*overlay.height;
+ // Smooth pose jitter before detecting direction changes.
+ smoothY = smoothY===null ? rawY : smoothY*.72 + rawY*.28;
+ const y=smoothY;
+ // Draw tracking point in both the large preview and the small picture-in-picture.
+ for(const [c,can] of [[ctx,overlay],[miniCtx,miniOverlay]]){
+  c.clearRect(0,0,can.width,can.height);
+  c.beginPath();c.arc(x,y,Math.max(10,can.width*.012),0,Math.PI*2);c.fillStyle="#f59e0b";c.fill();
+  c.beginPath();c.moveTo(shoulder.x*can.width,shoulder.y*can.height);c.lineTo(x,y);c.strokeStyle="#f59e0b";c.lineWidth=Math.max(3,can.width*.004);c.stroke();
+ }
+ // Do not collect beats while the reset pose is being held.
+ if(bothStill){lastWristY=y;return}
  if(lastWristY!==null){
   const dy=y-lastWristY;
-  // Count only the lower reversal (downstroke then upward movement), not both
-  // extremes. Counting both turns of a cycle can double the estimated tempo.
-  if(Math.abs(dy)>overlay.height*.0015){
-   const reversal = lastDY!==0 && Math.sign(dy)!==Math.sign(lastDY)
-     && Math.abs(lastDY)>overlay.height*.0022;
-   const lowerReversal = reversal && lastDY>0 && dy<0;
+  // Only one consistent extremum (bottom of downstroke). Require a meaningful
+  // excursion to suppress tiny pose-estimation jitter.
+  if(Math.abs(dy)>overlay.height*.0012){
+   const reversal=lastDY!==0 && Math.sign(dy)!==Math.sign(lastDY) && Math.abs(lastDY)>overlay.height*.0018;
+   const lowerReversal=reversal&&lastDY>0&&dy<0;
    if(lowerReversal){
-    const t=now;
+    const t=now, extY=lastWristY;
+    const prominence=lastExtremumY===null?Infinity:Math.abs(extY-lastExtremumY);
+    const interval=t-lastExtremumAt;
     if(lastExtremumAt===0){
-     lastExtremumAt=t; // first point is only a timing origin
-    } else {
-     const interval=t-lastExtremumAt;
-     if(interval>=250&&interval<=3000){
-      acceptCandidate(t,60000/interval);
-      lastExtremumAt=t;
-     } else if(interval>3000){
-      // Reacquire after a pause/missed cycle; do not report an absurd tempo.
-      lastExtremumAt=t;
-      bpmHistory=[];pending=[];
-     }
+     lastExtremumAt=t;lastExtremumY=extY;extremeProminence=0;
+    } else if(interval>=350&&interval<=3000){
+     acceptCandidate(t,60000/interval);
+     lastExtremumAt=t;lastExtremumY=extY;
+    } else if(interval>3000){
+     lastExtremumAt=t;lastExtremumY=extY;bpmHistory=[];pending=[];
     }
    }
    lastDY=dy;
@@ -214,50 +249,63 @@ function loop(){
  lastWristY=y;
 }
 function acceptCandidate(t,instantBpm){
- // Validate the elapsed time against the currently active beat period.
- // This rejects accidental duplicate detections while allowing gradual changes.
+ const interval=60000/instantBpm;
+ if(!Number.isFinite(instantBpm)||instantBpm<20||instantBpm>240)return;
+ // During startup/reset, learn the initial tempo from five consecutive intervals.
+ if(calibrating){
+  calibrationIntervals.push(instantBpm);
+  if(calibrationIntervals.length>5)calibrationIntervals.shift();
+  $("bpmMetric").textContent=Math.round(median(calibrationIntervals))+" BPM";
+  if(calibrationIntervals.length>=5){
+   const med=median(calibrationIntervals), spread=Math.max(...calibrationIntervals)-Math.min(...calibrationIntervals);
+   if(spread<=Math.max(8,med*.09)){
+    activeRef=initialRef=med;calibrating=false;pending=[];bpmHistory=[];greenBeats=0;
+    $("refMetric").textContent=Math.round(activeRef)+" BPM";
+    $("target").value=Math.round(activeRef);
+    setStatus("Tempo inicial calibrado: "+Math.round(activeRef)+" BPM. Ya puedes observar los colores respecto a esta referencia.");
+   }
+  }
+  lastAcceptedAt=t;beatTimes.push(t);if(beatTimes.length>20)beatTimes.shift();
+  chartPoints.push({t,bpm:instantBpm});if(chartPoints.length>120)chartPoints.shift();drawChart();
+  if(tempoScreen.classList.contains("active"))showTempo(instantBpm);
+  return;
+ }
+ // Suppress duplicate/omitted events using plausible interval ratios. Allow a
+ // genuine tempo change to be evaluated by the 9-beat stability window.
  if(lastAcceptedAt){
   const dt=t-lastAcceptedAt, expected=60000/activeRef;
-  if(dt<expected*.42 || dt>expected*2.2) return;
+  if(dt<expected*.48 || dt>expected*1.85)return;
  }
  lastAcceptedAt=t;
- beatTimes.push(t); if(beatTimes.length>20) beatTimes.shift();
- bpmHistory.push(instantBpm); if(bpmHistory.length>7) bpmHistory.shift();
- const sortedRecent=[...bpmHistory].sort((a,b)=>a-b);
- const bpm=sortedRecent[Math.floor(sortedRecent.length/2)];
+ beatTimes.push(t);if(beatTimes.length>20)beatTimes.shift();
+ bpmHistory.push(instantBpm);if(bpmHistory.length>5)bpmHistory.shift();
+ const bpm=median(bpmHistory);
  $("bpmMetric").textContent=Math.round(bpm)+" BPM";
- chartPoints.push({t,bpm}); if(chartPoints.length>120) chartPoints.shift(); drawChart();
+ chartPoints.push({t,bpm});if(chartPoints.length>120)chartPoints.shift();drawChart();
 
- // Determine colour relative to active reference, unless a new tempo was just confirmed.
- if(greenBeats>0){
-  setState("new");
-  greenBeats--;
-  if(greenBeats===0) setState(Math.abs(bpm-activeRef)<=3?"normal":(bpm>activeRef?"early":"late"));
- } else {
+ if(greenBeats>0){setState("new");greenBeats--;if(greenBeats===0)setState("normal")}
+ else {
   const deviation=bpm-activeRef;
-  if(Math.abs(deviation)<=3) setState("normal");
-  else if(deviation>3) setState("early");
+  if(Math.abs(deviation)<=3)setState("normal");
+  else if(deviation>3)setState("early");
   else setState("late");
  }
-
- // New-tempo candidate: nine consecutive estimates may fluctuate slightly.
- // Use median and median absolute deviation so one noisy beat doesn't block confirmation.
- pending.push(bpm); if(pending.length>9) pending.shift();
+ pending.push(bpm);if(pending.length>9)pending.shift();
  if(pending.length===9 && greenBeats===0){
-  const vals=[...pending].sort((a,b)=>a-b), med=vals[4];
-  const deviations=pending.map(v=>Math.abs(v-med)).sort((a,b)=>a-b);
-  const mad=deviations[4];
-  const change=Math.abs(med-activeRef);
-  const stable=mad<=2.5 && vals[8]-vals[0]<=8;
-  if(stable && change>3){
-   activeRef=med; pending=[]; greenBeats=3; setState("new");
+  const med=median(pending), spread=Math.max(...pending)-Math.min(...pending);
+  const stable=spread<=Math.max(6,med*.06);
+  if(stable && Math.abs(med-activeRef)>3){
+   activeRef=med;pending=[];greenBeats=3;setState("new");
    $("refMetric").textContent=Math.round(activeRef)+" BPM";
+   $("target").value=Math.round(activeRef);
   }
  }
- if(tempoScreen.classList.contains("active")){
-  showTempo(bpm);
-  tempoScreen.dataset.state=state;
- }
+ if(tempoScreen.classList.contains("active")){showTempo(bpm);tempoScreen.dataset.state=state}
+}
+function median(values){
+ if(!values.length)return NaN;
+ const a=[...values].sort((x,y)=>x-y);
+ return a[Math.floor(a.length/2)];
 }
 function drawChart(){
  const c=$("chart"),cx=c.getContext("2d"),w=c.width,h=c.height;

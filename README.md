@@ -19,3 +19,12 @@ La cámara requiere HTTPS o localhost. Puedes usar `python -m http.server 8000` 
 
 ## Actualización v3
 Esta versión evita contar ambos extremos verticales como pulsos, amplía el margen de estabilidad del nuevo tempo y cambia el nombre de caché del service worker para reducir el riesgo de seguir cargando la versión anterior. Sigue siendo un prototipo experimental: el gesto de dirección real requiere validación.
+
+
+## Cambios v5
+- Vista pequeña de la cámara en pantalla completa para ver el punto de seguimiento y el número simultáneamente.
+- Suavizado de la muñeca y umbral de desplazamiento para reducir falsas inversiones por jitter.
+- Calibración inicial a partir de cinco intervalos coherentes en lugar de aceptar el primer intervalo.
+- Gesto para reiniciar: ambas manos por encima de los hombros y quietas durante 1,2 s; luego bajar las manos y dirigir de nuevo.
+
+La detección sigue siendo experimental: si el gesto de dirección no produce un retorno vertical claro, la detección basada en la muñeca puede seguir siendo incorrecta.
