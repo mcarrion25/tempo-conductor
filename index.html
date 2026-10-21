@@ -61,7 +61,7 @@ footer{padding:0 18px 22px;color:#64748b;font-size:.78rem;max-width:980px;margin
     <input id="target" type="number" min="30" max="240" value="120" style="width:88px;padding:10px;border:1px solid #cbd5e1;border-radius:10px">
     <button id="setRef" class="secondary">Fijar referencia</button>
   </div>
-  <p class="status">El prototipo estima pulsos a partir de cambios periódicos en la trayectoria de la muñeca. Todavía no interpreta de forma fiable todos los patrones de dirección ni identifica automáticamente la anacrusa musical.</p>
+  <p class="status">Corrección importante: esta versión cuenta solo un tipo de punto de retorno de la muñeca por ciclo para evitar duplicar el tempo. Sigue siendo una estimación experimental: no reconoce automáticamente la anacrusa ni todos los patrones de dirección.</p>
   <div class="metrics" style="margin-top:12px">
     <div class="metric"><small>Tempo estimado</small><b id="bpmMetric">— BPM</b></div>
     <div class="metric"><small>Referencia activa</small><b id="refMetric">120 BPM</b></div>
@@ -186,18 +186,24 @@ function loop(){
  ctx.beginPath();ctx.moveTo(shoulder.x*overlay.width,shoulder.y*overlay.height);ctx.lineTo(x,y);ctx.strokeStyle="#f59e0b";ctx.lineWidth=Math.max(3,overlay.width*.004);ctx.stroke();
  if(lastWristY!==null){
   const dy=y-lastWristY;
-  // Detect vertical direction reversals with hysteresis; each extremum is only a candidate beat.
-  if(Math.abs(dy)>overlay.height*.0018){
-   if(lastDY!==0 && Math.sign(dy)!==Math.sign(lastDY) && Math.abs(lastDY)>overlay.height*.0025){
+  // Image y grows downwards. Count only the bottom of the downstroke
+  // (moving down, then reversing upward), not both reversals of each cycle.
+  // Counting both top and bottom was causing a roughly doubled tempo.
+  if(Math.abs(dy)>overlay.height*.0015){
+   const reversal = lastDY!==0 && Math.sign(dy)!==Math.sign(lastDY)
+     && Math.abs(lastDY)>overlay.height*.0022;
+   const isDownstrokeBottom = reversal && lastDY>0 && dy<0;
+   if(isDownstrokeBottom){
     const t=now;
-    if(t-lastExtremumAt>220){
-     const interval=t-lastExtremumAt;
+    const interval=t-lastExtremumAt;
+    if(lastExtremumAt===0){
+     lastExtremumAt=t; // first point sets timing origin only
+    } else if(interval>=250&&interval<=3000){
+     acceptCandidate(t,60000/interval);
      lastExtremumAt=t;
-     // Restrict raw beat candidates to plausible range; filter likely half/double tempo ratios.
-     if(interval>=250&&interval<=2000){
-      const instantBpm=60000/interval;
-      acceptCandidate(t,instantBpm);
-     }
+    } else if(interval>3000){
+     lastExtremumAt=t;
+     bpmHistory=[];pending=[];
     }
    }
    lastDY=dy;
@@ -206,13 +212,12 @@ function loop(){
  lastWristY=y;
 }
 function acceptCandidate(t,instantBpm){
- // Use recent valid beat intervals to reject likely double/half-time detections.
+ // Reject isolated detections that are much too close or far apart.
+ // The main half/double protection comes from measuring one matching extremum
+ // per full movement cycle, rather than every direction reversal.
  if(lastAcceptedAt){
   const dt=t-lastAcceptedAt, expected=60000/activeRef;
-  if(dt<expected*.46 || dt>expected*2.15){
-   // Treat likely duplicate/omission as suspicious; do not change reference from it.
-   if(dt<expected*.46 || dt>expected*1.8){return}
-  }
+  if(dt<expected*.42 || dt>expected*2.2) return;
  }
  lastAcceptedAt=t;beatTimes.push(t);if(beatTimes.length>20)beatTimes.shift();
  bpmHistory.push(instantBpm);if(bpmHistory.length>12)bpmHistory.shift();
