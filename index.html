@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<meta name="description" content="Prototipo para analizar el tempo de estudiantes de Dirección mediante la cámara del móvil.">
+<link rel="manifest" href="manifest.json">
+<title>TempoConductor — Prototipo</title>
+<style>
+:root{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111;background:#f4f5f6}
+*{box-sizing:border-box}body{margin:0;min-height:100vh}
+button,select{font:inherit}button{border:0;border-radius:12px;padding:12px 16px;background:#17252c;color:#fff;font-weight:650;cursor:pointer}
+button.secondary{background:#e5e7eb;color:#111}button:disabled{opacity:.45;cursor:not-allowed}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;background:#fff;border-bottom:1px solid #e5e7eb}
+header strong{font-size:1.05rem}header span{font-size:.78rem;color:#64748b}
+main{max-width:980px;margin:0 auto;padding:16px;display:grid;gap:16px}
+.panel{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:16px}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.status{font-size:.9rem;color:#475569;line-height:1.45}
+#cameraWrap{position:relative;background:#111;border-radius:14px;overflow:hidden;min-height:220px;aspect-ratio:4/3}
+#video,#overlay{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+#overlay{pointer-events:none}
+#tempoScreen{position:fixed;inset:0;z-index:20;display:none;align-items:center;justify-content:center;flex-direction:column;background:#fff;color:#111}
+#tempoScreen.active{display:flex}
+#tempoValue{font-size:min(70vw,72vh);font-weight:850;line-height:.85;letter-spacing:-.07em;font-variant-numeric:tabular-nums}
+#tempoSub{font-size:clamp(14px,2.5vw,22px);margin-top:18px;opacity:.75}
+#closeFullscreen{position:absolute;top:max(12px,env(safe-area-inset-top));right:12px;background:rgba(0,0,0,.12);color:inherit;border-radius:999px;padding:10px 14px;font-size:14px}
+#tempoScreen[data-state="late"]{background:#dc2626;color:#fff}
+#tempoScreen[data-state="early"]{background:#2563eb;color:#fff}
+#tempoScreen[data-state="new"]{background:#16a34a;color:#fff}
+#tempoScreen[data-state="normal"]{background:#fff;color:#111}
+.metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.metric{background:#f8fafc;border-radius:12px;padding:12px}.metric small{display:block;color:#64748b}.metric b{font-size:1.25rem}
+canvas#chart{width:100%;height:210px;display:block}
+details summary{cursor:pointer;font-weight:650}
+footer{padding:0 18px 22px;color:#64748b;font-size:.78rem;max-width:980px;margin:auto}
+@media(max-width:600px){main{padding:10px}.panel{padding:12px}.metrics{grid-template-columns:1fr 1fr}#tempoValue{font-size:min(78vw,68vh)}}
+</style>
+</head>
+<body>
+<header><div><strong>TempoConductor</strong><br><span>Prototipo experimental · cámara frontal</span></div><span id="modelStatus">Preparando detector…</span></header>
+<main>
+<section class="panel">
+  <h2 style="margin:0 0 8px">1. Cámara y seguimiento</h2>
+  <p class="status">Coloca el móvil frente al estudiante, con el brazo que dirige visible. La detección corporal funciona en el dispositivo; el detector se descarga la primera vez.</p>
+  <div id="cameraWrap"><video id="video" playsinline muted></video><canvas id="overlay"></canvas></div>
+  <div class="controls" style="margin-top:12px">
+    <button id="startBtn" disabled>Activar cámara</button>
+    <button id="stopBtn" class="secondary" disabled>Detener</button>
+    <button id="fullBtn" class="secondary" disabled>Abrir pantalla de tempo</button>
+  </div>
+  <p id="status" class="status" aria-live="polite">Cargando el modelo de seguimiento… Necesitas conexión para la primera carga y abrir esta página mediante HTTPS o localhost.</p>
+</section>
+<section class="panel">
+  <h2 style="margin:0 0 8px">2. Referencia y análisis</h2>
+  <div class="controls">
+    <label for="hand">Brazo que dirige</label>
+    <select id="hand"><option value="right">Derecho</option><option value="left">Izquierdo</option></select>
+    <label for="target">Tempo inicial (BPM)</label>
+    <input id="target" type="number" min="30" max="240" value="120" style="width:88px;padding:10px;border:1px solid #cbd5e1;border-radius:10px">
+    <button id="setRef" class="secondary">Fijar referencia</button>
+  </div>
+  <p class="status">El prototipo estima pulsos a partir de cambios periódicos en la trayectoria de la muñeca. Todavía no interpreta de forma fiable todos los patrones de dirección ni identifica automáticamente la anacrusa musical.</p>
+  <div class="metrics" style="margin-top:12px">
+    <div class="metric"><small>Tempo estimado</small><b id="bpmMetric">— BPM</b></div>
+    <div class="metric"><small>Referencia activa</small><b id="refMetric">120 BPM</b></div>
+    <div class="metric"><small>Estado</small><b id="stateMetric">En espera</b></div>
+  </div>
+</section>
+<section class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">3. Evolución del tempo</h2><button id="resetBtn" class="secondary">Reiniciar sesión</button></div>
+  <canvas id="chart" width="900" height="240" aria-label="Gráfico del tempo estimado"></canvas>
+  <p class="status">La referencia inicial se conserva. La referencia activa solo cambia tras confirmar una zona estable. En esta primera versión, el cálculo es experimental y debe contrastarse con un metrónomo.</p>
+</section>
+<details class="panel"><summary>Reglas previstas del algoritmo</summary>
+<ul class="status">
+<li>Tolerancia inicial: ±3 BPM respecto a la referencia activa.</li>
+<li>Fondo rojo: se retrasa. Fondo azul: se adelanta. Fondo blanco: dentro de tolerancia.</li>
+<li>Un candidato a nuevo tempo debe formar una zona estable durante 9 beats válidos; se admiten pequeñas fluctuaciones.</li>
+<li>Al confirmar un nuevo tempo, fondo verde durante 3 pulsos y después blanco.</li>
+<li>Se filtran posibles detecciones a doble o mitad del tempo.</li>
+<li>Los cambios bruscos de más de 12 BPM se marcan como candidatos a nuevo tempo, pero no se aceptan sin estabilidad.</li>
+</ul>
+</details>
+</main>
+<footer>Prototipo técnico, no instrumento de evaluación validado. El vídeo se procesa localmente; no se graba ni se envía a ningún servidor desde esta página. El modelo de visión se descarga de un CDN al iniciar.</footer>
+
+<div id="tempoScreen" data-state="normal" role="dialog" aria-label="Tempo a pantalla completa">
+  <button id="closeFullscreen">Cerrar ✕</button>
+  <div id="tempoValue">120</div>
+  <div id="tempoSub"></div>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const $ = id => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), ctx = overlay.getContext("2d");
+const tempoScreen = $("tempoScreen"), tempoValue = $("tempoValue"), tempoSub = $("tempoSub");
+let landmarker = null, stream = null, running = false, raf = 0;
+let lastVideoTime = -1, lastWristY = null, lastDY = 0, lastExtremumAt = 0;
+let extrema = [], beatTimes = [], bpmHistory = [], chartPoints = [];
+let activeRef = 120, initialRef = 120, pending = [], greenBeats = 0, greenUntil = 0;
+let state = "normal", lastAcceptedAt = 0, lastPulseTime = 0;
+const modelStatus = $("modelStatus"), statusEl = $("status");
+
+function setStatus(s){statusEl.textContent=s}
+async function loadModel(){
+ try{
+  modelStatus.textContent="Cargando modelo…";
+  const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await PoseLandmarker.createFromOptions(vision,{
+   baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",delegate:"GPU"},
+   runningMode:"VIDEO",numPoses:1,minPoseDetectionConfidence:.5,minPosePresenceConfidence:.5,minTrackingConfidence:.5
+  });
+  modelStatus.textContent="Detector listo"; $("startBtn").disabled=false;
+  setStatus("Modelo listo. Activa la cámara para empezar.");
+ }catch(e){
+  modelStatus.textContent="Modelo no disponible";
+  setStatus("No se pudo cargar el modelo. Comprueba la conexión y vuelve a cargar la página. Detalle: "+e.message);
+ }
+}
+function setState(next){
+ state=next; tempoScreen.dataset.state=next;
+ $("stateMetric").textContent=({normal:"Estable",late:"Se retrasa",early:"Se adelanta",new:"Nuevo tempo"})[next]||next;
+}
+function showTempo(bpm){
+ tempoValue.textContent=Number.isFinite(bpm)?String(Math.round(bpm)):"—";
+ tempoSub.textContent="";
+}
+function enterFullscreen(){
+ tempoScreen.classList.add("active");
+ showTempo(Number($("bpmMetric").textContent.match(/\d+/)?.[0])||activeRef);
+ if(tempoScreen.requestFullscreen) tempoScreen.requestFullscreen().catch(()=>{});
+}
+function exitFullscreen(){
+ tempoScreen.classList.remove("active");
+ if(document.fullscreenElement) document.exitFullscreen?.().catch(()=>{});
+}
+$("fullBtn").addEventListener("click",enterFullscreen);
+$("closeFullscreen").addEventListener("click",exitFullscreen);
+document.addEventListener("fullscreenchange",()=>{if(!document.fullscreenElement)tempoScreen.classList.remove("active")});
+
+$("startBtn").addEventListener("click",async()=>{
+ try{
+  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:1280},height:{ideal:720},frameRate:{ideal:60,max:60}},audio:false});
+  video.srcObject=stream; await video.play();
+  overlay.width=video.videoWidth;overlay.height=video.videoHeight;
+  running=true;lastVideoTime=-1;setStatus("Cámara activa. Mantén visible la muñeca y realiza un gesto de dirección regular.");
+  $("startBtn").disabled=true;$("stopBtn").disabled=false;$("fullBtn").disabled=false;
+  loop();
+ }catch(e){setStatus("No se pudo acceder a la cámara. Permite el acceso y usa HTTPS o localhost. "+e.message)}
+});
+$("stopBtn").addEventListener("click",stopCamera);
+function stopCamera(){
+ running=false;cancelAnimationFrame(raf);
+ if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;
+ $("startBtn").disabled=false;$("stopBtn").disabled=true;
+ ctx.clearRect(0,0,overlay.width,overlay.height);setStatus("Cámara detenida.");
+}
+$("setRef").addEventListener("click",()=>{
+ const v=Math.max(30,Math.min(240,Number($("target").value)||120));
+ initialRef=activeRef=v;pending=[];beatTimes=[];bpmHistory=[];greenBeats=0;
+ $("refMetric").textContent=Math.round(activeRef)+" BPM";setState("normal");setStatus("Referencia inicial fijada en "+Math.round(v)+" BPM.");
+});
+$("resetBtn").addEventListener("click",()=>{
+ pending=[];beatTimes=[];bpmHistory=[];chartPoints=[];activeRef=initialRef=Math.max(30,Math.min(240,Number($("target").value)||120));
+ $("refMetric").textContent=Math.round(activeRef)+" BPM";$("bpmMetric").textContent="— BPM";setState("normal");drawChart();
+});
+function loop(){
+ if(!running)return;
+ raf=requestAnimationFrame(loop);
+ if(video.readyState<2||video.currentTime===lastVideoTime||!landmarker)return;
+ lastVideoTime=video.currentTime;
+ const now=performance.now();
+ let result;
+ try{result=landmarker.detectForVideo(video,now)}catch(e){return}
+ ctx.clearRect(0,0,overlay.width,overlay.height);
+ const pose=result.landmarks?.[0];if(!pose)return;
+ // Pose landmark indices: left wrist 15, right wrist 16, shoulders 11/12.
+ const side=$("hand").value, wrist=pose[side==="right"?16:15], shoulder=pose[side==="right"?12:11];
+ if(!wrist||wrist.visibility<.35||!shoulder||shoulder.visibility<.25)return;
+ const x=wrist.x*overlay.width,y=wrist.y*overlay.height;
+ ctx.beginPath();ctx.arc(x,y,Math.max(9,overlay.width*.012),0,Math.PI*2);ctx.fillStyle="#f59e0b";ctx.fill();
+ ctx.beginPath();ctx.moveTo(shoulder.x*overlay.width,shoulder.y*overlay.height);ctx.lineTo(x,y);ctx.strokeStyle="#f59e0b";ctx.lineWidth=Math.max(3,overlay.width*.004);ctx.stroke();
+ if(lastWristY!==null){
+  const dy=y-lastWristY;
+  // Detect vertical direction reversals with hysteresis; each extremum is only a candidate beat.
+  if(Math.abs(dy)>overlay.height*.0018){
+   if(lastDY!==0 && Math.sign(dy)!==Math.sign(lastDY) && Math.abs(lastDY)>overlay.height*.0025){
+    const t=now;
+    if(t-lastExtremumAt>220){
+     const interval=t-lastExtremumAt;
+     lastExtremumAt=t;
+     // Restrict raw beat candidates to plausible range; filter likely half/double tempo ratios.
+     if(interval>=250&&interval<=2000){
+      const instantBpm=60000/interval;
+      acceptCandidate(t,instantBpm);
+     }
+    }
+   }
+   lastDY=dy;
+  }
+ }
+ lastWristY=y;
+}
+function acceptCandidate(t,instantBpm){
+ // Use recent valid beat intervals to reject likely double/half-time detections.
+ if(lastAcceptedAt){
+  const dt=t-lastAcceptedAt, expected=60000/activeRef;
+  if(dt<expected*.46 || dt>expected*2.15){
+   // Treat likely duplicate/omission as suspicious; do not change reference from it.
+   if(dt<expected*.46 || dt>expected*1.8){return}
+  }
+ }
+ lastAcceptedAt=t;beatTimes.push(t);if(beatTimes.length>20)beatTimes.shift();
+ bpmHistory.push(instantBpm);if(bpmHistory.length>12)bpmHistory.shift();
+ const recent=bpmHistory.slice(-5).sort((a,b)=>a-b);
+ const bpm=recent[Math.floor(recent.length/2)];
+ $("bpmMetric").textContent=Math.round(bpm)+" BPM";
+ chartPoints.push({t,bpm});if(chartPoints.length>120)chartPoints.shift();drawChart();
+ const deviation=bpm-activeRef;
+ if(greenBeats>0){
+  setState("new");greenBeats--;if(greenBeats===0)setState("normal");
+ }else if(Math.abs(deviation)<=3){setState("normal")}
+ else if(deviation>3){setState("early")}
+ else {setState("late")}
+ // Candidate tempo window: nine consecutive estimates in a tight cluster, allowing small fluctuations.
+ pending.push(bpm);if(pending.length>9)pending.shift();
+ if(pending.length===9){
+  const sorted=[...pending].sort((a,b)=>a-b), med=sorted[4];
+  const spread=sorted[8]-sorted[0];
+  const change=Math.abs(med-activeRef);
+  const stable=spread<=5 && Math.abs(med-pending[0])<=4;
+  if(stable && change>3){
+   activeRef=med;pending=[];greenBeats=3;setState("new");
+   $("refMetric").textContent=Math.round(activeRef)+" BPM";
+   if(tempoScreen.classList.contains("active"))showTempo(med);
+  }
+ }
+ if(tempoScreen.classList.contains("active")){
+  showTempo(bpm);
+  tempoScreen.dataset.state=state;
+ }
+}
+function drawChart(){
+ const c=$("chart"),cx=c.getContext("2d"),w=c.width,h=c.height;
+ cx.clearRect(0,0,w,h);cx.fillStyle="#fff";cx.fillRect(0,0,w,h);
+ const left=45,right=15,top=15,bottom=28,plotW=w-left-right,plotH=h-top-bottom;
+ const vals=chartPoints.map(p=>p.bpm);const min=Math.min(40,Math.floor((Math.min(...vals,activeRef)-10)/10)*10);
+ const max=Math.max(160,Math.ceil((Math.max(...vals,activeRef)+10)/10)*10);
+ cx.font="14px system-ui";cx.fillStyle="#64748b";cx.strokeStyle="#e2e8f0";cx.lineWidth=1;
+ for(let i=0;i<=4;i++){const y=top+plotH*i/4;cx.beginPath();cx.moveTo(left,y);cx.lineTo(w-right,y);cx.stroke();cx.fillText(String(Math.round(max-(max-min)*i/4)),4,y+5)}
+ const yFor=v=>top+(max-v)/(max-min)*plotH;
+ cx.setLineDash([7,5]);cx.strokeStyle="#94a3b8";cx.beginPath();cx.moveTo(left,yFor(initialRef));cx.lineTo(w-right,yFor(initialRef));cx.stroke();cx.setLineDash([]);
+ if(chartPoints.length>1){cx.strokeStyle="#2563eb";cx.lineWidth=3;cx.beginPath();chartPoints.forEach((p,i)=>{const x=left+i/(Math.max(1,chartPoints.length-1))*plotW,y=yFor(p.bpm);if(i===0)cx.moveTo(x,y);else cx.lineTo(x,y)});cx.stroke()}
+ cx.fillStyle="#475569";cx.fillText("Tempo (BPM)",left,h-6);
+}
+drawChart();loadModel();
+if("serviceWorker" in navigator && location.protocol.startsWith("http")) navigator.serviceWorker.register("./sw.js").catch(()=>{});
+</script>
+</body>
+</html>
